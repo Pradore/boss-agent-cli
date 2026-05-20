@@ -37,6 +37,11 @@ boss status    # 验证登录态
 │   → boss watch run <name>  (已有监控)
 │   → boss recommend         (个性化推荐)
 │
+├─ "帮我筛选推荐候选人并打招呼"
+│   → boss hr recommend-candidates --limit 5  (批量采集)
+│   → 筛选后 → boss hr recommend-action <geek_id>  (逐个打招呼)
+│   → 详见 docs/integrations/recommend-greet-skill.md
+│
 ├─ "我的求职进展怎样？"
 │   → boss pipeline → boss follow-up → boss digest
 │
@@ -70,6 +75,9 @@ boss status    # 验证登录态
 | `boss hr reply <friend_id> <message>` | 回复候选人消息 |
 | `boss hr request-resume <friend_id> --job-id <id>` | 请求候选人附件简历 |
 | `boss hr jobs list/online/offline` | 职位列表与上下线管理 |
+| `boss hr recommend-candidates` | 通过 CDP 采集推荐候选人卡片（iframe 内） |
+| `boss hr recommend-action <geek_id>` | 对推荐候选人执行打招呼 |
+| `boss hr inspect-page` | CDP 页面探测（含 iframe 检测） |
 
 ### Discovery & Auth
 

@@ -38,7 +38,9 @@ from boss_agent_cli.commands import (
 from boss_agent_cli.commands.recruiter import applications as recruiter_applications
 from boss_agent_cli.commands.recruiter import candidates as recruiter_candidates
 from boss_agent_cli.commands.recruiter import chat as recruiter_chat
+from boss_agent_cli.commands.recruiter import inspect_page as recruiter_inspect_page
 from boss_agent_cli.commands.recruiter import jobs as recruiter_jobs
+from boss_agent_cli.commands.recruiter import recommend as recruiter_recommend
 from boss_agent_cli.commands.recruiter import reply as recruiter_reply
 from boss_agent_cli.commands.recruiter import request_resume as recruiter_request_resume
 from boss_agent_cli.commands.recruiter import resume as recruiter_resume
@@ -115,5 +117,9 @@ def register_recruiter_commands(cli: click.Group) -> None:
 	hr_group.add_command(recruiter_chat.recruiter_last_messages_cmd, "last-messages")
 	hr_group.add_command(recruiter_jobs.jobs_group, "jobs")
 	hr_group.add_command(recruiter_candidates.candidates_cmd, "candidates")
+	hr_group.add_command(recruiter_inspect_page.inspect_page_cmd, "inspect-page")
+	hr_group.add_command(recruiter_inspect_page.navigate_cmd, "navigate")
+	hr_group.add_command(recruiter_recommend.recommend_candidates_cmd, "recommend-candidates")
+	hr_group.add_command(recruiter_recommend.recommend_action_cmd, "recommend-action")
 	hr_group.add_command(recruiter_reply.reply_cmd, "reply")
 	hr_group.add_command(recruiter_request_resume.request_resume_cmd, "request-resume")

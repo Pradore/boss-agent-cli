@@ -1,10 +1,12 @@
 import json
 from unittest.mock import patch
 
+import pytest
 from click.testing import CliRunner
 
 from boss_agent_cli.main import cli
 from boss_agent_cli.commands.recruiter.resume_parser import parse_resume
+from boss_agent_cli.commands.recruiter.inspect_page import _pick_page_ws, _load_cdp_tabs
 
 
 def _ctx_mock(mock_cls):
@@ -543,3 +545,452 @@ def test_hr_group_rejects_unsupported_zhilian_platform():
 	assert parsed["error"]["code"] == "PLATFORM_NOT_SUPPORTED"
 	assert "暂不支持平台" in parsed["error"]["message"]
 	assert "boss --platform zhipin hr ..." == parsed["error"]["recovery_action"]
+
+
+# ---------------------------------------------------------------------------
+# inspect-page 命令测试
+# ---------------------------------------------------------------------------
+
+_FAKE_INSPECT_DATA = {
+	"url": "https://www.zhipin.com/web/chat/recommend",
+	"title": "推荐候选人",
+	"readyState": "complete",
+	"bodyTextSample": "本科 3年经验 打招呼",
+	"buttons": [{"text": "打招呼", "tag": "BUTTON", "className": "", "href": ""}],
+	"candidateBlocks": [
+		{
+			"index": 1,
+			"domIndex": 42,
+			"tag": "DIV",
+			"className": "card",
+			"text": "候选人A 本科 3年经验",
+			"buttons": [{"text": "打招呼", "tag": "BUTTON", "className": "", "href": ""}],
+		}
+	],
+	"targetTab": {"id": "tab1", "title": "推荐候选人", "url": "https://www.zhipin.com/web/chat/recommend"},
+}
+
+
+@patch("boss_agent_cli.commands.recruiter.inspect_page.inspect_cdp_page")
+def test_inspect_page_success(mock_inspect):
+	"""inspect-page 成功时输出 JSON envelope。"""
+	mock_inspect.return_value = _FAKE_INSPECT_DATA
+	result = _invoke("--json", "hr", "inspect-page")
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert parsed["data"]["candidateBlocks"][0]["text"] == "候选人A 本科 3年经验"
+	assert parsed["data"]["targetTab"]["url"] == "https://www.zhipin.com/web/chat/recommend"
+
+
+@patch("boss_agent_cli.commands.recruiter.inspect_page.inspect_cdp_page")
+def test_inspect_page_cdp_unreachable(mock_inspect):
+	"""CDP 不可达时输出 CDP_INSPECT_FAILED 错误。"""
+	mock_inspect.side_effect = RuntimeError("cannot reach CDP at http://localhost:9222/json")
+	result = _invoke("--json", "hr", "inspect-page")
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "CDP_INSPECT_FAILED"
+	assert parsed["error"]["recoverable"] is True
+	assert "cannot reach CDP" in parsed["error"]["message"]
+
+
+@patch("boss_agent_cli.commands.recruiter.inspect_page.inspect_cdp_page")
+def test_inspect_page_url_contains_forwarded(mock_inspect):
+	"""--url-contains 参数正确传入底层函数。"""
+	mock_inspect.return_value = _FAKE_INSPECT_DATA
+	_invoke("--json", "hr", "inspect-page", "--url-contains", "recommend")
+	mock_inspect.assert_called_once()
+	_, kwargs = mock_inspect.call_args
+	assert kwargs["url_contains"] == "recommend"
+
+
+# ---------------------------------------------------------------------------
+# _pick_page_ws / _load_cdp_tabs 内部函数单元测试
+# ---------------------------------------------------------------------------
+
+_TAB_ZHIPIN = {
+	"type": "page",
+	"url": "https://www.zhipin.com/web/chat/recommend",
+	"title": "BOSS",
+	"webSocketDebuggerUrl": "ws://localhost:9222/devtools/page/zhipin",
+}
+_TAB_OTHER = {
+	"type": "page",
+	"url": "https://www.google.com",
+	"title": "Google",
+	"webSocketDebuggerUrl": "ws://localhost:9222/devtools/page/other",
+}
+_TAB_DEVTOOLS = {
+	"type": "page",
+	"url": "devtools://devtools/inspector.html",
+	"title": "DevTools",
+	"webSocketDebuggerUrl": "ws://localhost:9222/devtools/page/dt",
+}
+_TAB_ABOUT = {
+	"type": "page",
+	"url": "about:blank",
+	"title": "",
+	"webSocketDebuggerUrl": "ws://localhost:9222/devtools/page/blank",
+}
+
+
+def test_pick_page_ws_prefers_zhipin():
+	"""有多个 tab 时优先选 zhipin.com 页面。"""
+	ws, tab = _pick_page_ws([_TAB_OTHER, _TAB_ZHIPIN], url_contains=None)
+	assert ws == "ws://localhost:9222/devtools/page/zhipin"
+	assert tab["url"] == "https://www.zhipin.com/web/chat/recommend"
+
+
+def test_pick_page_ws_filters_devtools_and_about():
+	"""devtools:// 和 about: 页面被过滤。"""
+	ws, tab = _pick_page_ws([_TAB_DEVTOOLS, _TAB_ABOUT, _TAB_OTHER], url_contains=None)
+	assert ws == "ws://localhost:9222/devtools/page/other"
+
+
+def test_pick_page_ws_no_page_raises():
+	"""无可用 tab 时抛出 RuntimeError。"""
+	with pytest.raises(RuntimeError, match="no inspectable page tab found"):
+		_pick_page_ws([_TAB_DEVTOOLS, _TAB_ABOUT], url_contains=None)
+
+
+def test_pick_page_ws_url_contains_filter():
+	"""url_contains 能进一步过滤 tab。"""
+	ws, tab = _pick_page_ws([_TAB_ZHIPIN, _TAB_OTHER], url_contains="google.com")
+	assert tab["url"] == "https://www.google.com"
+
+
+@patch("urllib.request.urlopen")
+def test_load_cdp_tabs_unreachable(mock_urlopen):
+	"""CDP HTTP 不可达时抛出 RuntimeError。"""
+	mock_urlopen.side_effect = ConnectionRefusedError("refused")
+	with pytest.raises(RuntimeError, match="cannot reach CDP"):
+		_load_cdp_tabs("http://localhost:9222")
+
+
+# ---------------------------------------------------------------------------
+# recommend-candidates / recommend-action 命令测试
+# ---------------------------------------------------------------------------
+
+_FAKE_RECOMMEND_DATA = {
+	"page_url": "https://www.zhipin.com/web/chat/recommend",
+	"iframe_url": "https://www.zhipin.com/web/frame/recommend/?jobid=null",
+	"total_found": 2,
+	"candidates": [
+		{
+			"index": 1,
+			"geek_id": "abc123def456",
+			"name": "候选人A",
+			"base_info": "25岁 27年应届生 本科 刚刚活跃",
+			"expect": "期望 北京 算法工程师",
+			"edu": "清华大学 计算机 本科",
+			"work": "2025.01 2025.06 美团 工程师",
+			"tags": ["QS前100院校", "专业前1%"],
+			"salary": "面议",
+			"avatar_url": "https://img.bosszhipin.com/avatar/a.png",
+			"gender": "male",
+			"greet_btn": {"text": "打招呼", "disabled": False},
+		},
+		{
+			"index": 2,
+			"geek_id": "xyz789ghi012",
+			"name": "候选人B",
+			"base_info": "23岁 28年应届生 硕士",
+			"expect": "期望 上海 后端开发",
+			"edu": "北京大学 软件工程 硕士",
+			"work": None,
+			"tags": ["QS前500院校"],
+			"salary": "15-25K",
+			"avatar_url": "https://img.bosszhipin.com/avatar/b.png",
+			"gender": "female",
+			"greet_btn": {"text": "打招呼", "disabled": False},
+		},
+	],
+	"targetTab": {"id": "tab1", "title": "推荐候选人", "url": "https://www.zhipin.com/web/chat/recommend"},
+}
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._collect_candidates")
+def test_recommend_candidates_success(mock_collect):
+	"""recommend-candidates 成功时输出候选人 JSON。"""
+	mock_collect.return_value = _FAKE_RECOMMEND_DATA
+	result = _invoke("--json", "hr", "recommend-candidates")
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert parsed["data"]["total_found"] == 2
+	assert len(parsed["data"]["candidates"]) == 2
+	assert parsed["data"]["candidates"][0]["geek_id"] == "abc123def456"
+	assert parsed["data"]["candidates"][0]["name"] == "候选人A"
+	assert parsed["data"]["candidates"][0]["tags"] == ["QS前100院校", "专业前1%"]
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._collect_candidates")
+def test_recommend_candidates_cdp_unreachable(mock_collect):
+	"""CDP 不可达时输出 CDP_RECOMMEND_FAILED。"""
+	mock_collect.side_effect = RuntimeError("cannot reach CDP")
+	result = _invoke("--json", "hr", "recommend-candidates")
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "CDP_RECOMMEND_FAILED"
+	assert parsed["error"]["recoverable"] is True
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._collect_candidates")
+def test_recommend_candidates_empty_page(mock_collect):
+	"""页面无候选人时返回空列表。"""
+	mock_collect.return_value = {
+		"page_url": "https://www.zhipin.com/web/chat/recommend",
+		"iframe_url": "https://www.zhipin.com/web/frame/recommend/",
+		"total_found": 0,
+		"candidates": [],
+		"targetTab": {"id": "tab1", "title": "推荐", "url": "https://www.zhipin.com/web/chat/recommend"},
+	}
+	result = _invoke("--json", "hr", "recommend-candidates")
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert parsed["data"]["total_found"] == 0
+	assert parsed["data"]["candidates"] == []
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._collect_candidates")
+def test_recommend_candidates_limit_forwarded(mock_collect):
+	"""--limit 参数正确传入底层函数。"""
+	mock_collect.return_value = _FAKE_RECOMMEND_DATA
+	_invoke("--json", "hr", "recommend-candidates", "--limit", "10")
+	mock_collect.assert_called_once()
+	_, kwargs = mock_collect.call_args
+	assert kwargs["limit"] == 10
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._execute_action")
+def test_recommend_action_success(mock_action):
+	"""recommend-action 成功点击时输出确认信息。"""
+	mock_action.return_value = {
+		"clicked": True,
+		"geek_id": "abc123def456",
+		"candidate_name": "候选人A",
+		"button_text": "打招呼",
+		"confirmation": {
+			"button_changed": True,
+			"old_button_text": "打招呼",
+			"new_button_text": "已沟通",
+			"disabled_changed": False,
+			"toast_detected": None,
+			"confidence": "high",
+		},
+		"targetTab": {"id": "tab1", "title": "推荐", "url": "https://www.zhipin.com/web/chat/recommend"},
+	}
+	result = _invoke("--json", "hr", "recommend-action", "abc123def456")
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert parsed["data"]["clicked"] is True
+	assert parsed["data"]["geek_id"] == "abc123def456"
+	assert parsed["data"]["confirmation"]["confidence"] == "high"
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._execute_action")
+def test_recommend_action_button_not_found(mock_action):
+	"""按钮文本不匹配时输出 BUTTON_NOT_FOUND。"""
+	mock_action.return_value = {
+		"clicked": False,
+		"error": "button_not_found",
+		"message": 'no button matching "不存在"',
+		"available_buttons": ["打招呼"],
+	}
+	result = _invoke("--json", "hr", "recommend-action", "abc123def456", "--button", "不存在")
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "BUTTON_NOT_FOUND"
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._execute_action")
+def test_recommend_action_cdp_unreachable(mock_action):
+	"""CDP 不可达时输出 CDP_ACTION_FAILED。"""
+	mock_action.side_effect = RuntimeError("cannot reach CDP")
+	result = _invoke("--json", "hr", "recommend-action", "abc123def456")
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "CDP_ACTION_FAILED"
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._execute_action")
+def test_recommend_action_candidate_not_found(mock_action):
+	"""geek_id 在页面上找不到时输出 CANDIDATE_NOT_FOUND。"""
+	mock_action.return_value = {
+		"clicked": False,
+		"error": "candidate_not_found",
+		"message": "no card with geekid=unknown123 found; re-run recommend-candidates",
+	}
+	result = _invoke("--json", "hr", "recommend-action", "unknown123")
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "CANDIDATE_NOT_FOUND"
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._execute_action")
+def test_recommend_action_confirms_button_change(mock_action):
+	"""按钮文案变化时 confidence=high。"""
+	mock_action.return_value = {
+		"clicked": True,
+		"geek_id": "abc123def456",
+		"candidate_name": "候选人A",
+		"button_text": "打招呼",
+		"confirmation": {
+			"button_changed": True,
+			"old_button_text": "打招呼",
+			"new_button_text": "已沟通",
+			"disabled_changed": False,
+			"toast_detected": None,
+			"confidence": "high",
+		},
+		"targetTab": {"id": "t1", "title": "推荐", "url": "https://www.zhipin.com/web/chat/recommend"},
+	}
+	result = _invoke("--json", "hr", "recommend-action", "abc123def456")
+	parsed = json.loads(result.output)
+	assert parsed["data"]["confirmation"]["button_changed"] is True
+	assert parsed["data"]["confirmation"]["confidence"] == "high"
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._execute_action")
+def test_recommend_action_no_confirmation_signal(mock_action):
+	"""无变化信号时 confidence=medium。"""
+	mock_action.return_value = {
+		"clicked": True,
+		"geek_id": "abc123def456",
+		"candidate_name": "候选人A",
+		"button_text": "打招呼",
+		"confirmation": {
+			"button_changed": False,
+			"old_button_text": "打招呼",
+			"new_button_text": "打招呼",
+			"disabled_changed": False,
+			"toast_detected": None,
+			"confidence": "medium",
+		},
+		"targetTab": {"id": "t1", "title": "推荐", "url": "https://www.zhipin.com/web/chat/recommend"},
+	}
+	result = _invoke("--json", "hr", "recommend-action", "abc123def456")
+	parsed = json.loads(result.output)
+	assert parsed["data"]["confirmation"]["confidence"] == "medium"
+
+
+# ---------------------------------------------------------------------------
+# 安全性 & 健壮性测试
+# ---------------------------------------------------------------------------
+
+@patch("boss_agent_cli.commands.recruiter.recommend._execute_action")
+def test_recommend_action_selector_injection_geek_id(mock_action):
+	"""含引号的 geek_id 不应导致 CSS 选择器注入，应正常传递到底层。"""
+	malicious_id = 'abc"][data-geekid="xyz'
+	mock_action.return_value = {
+		"clicked": False,
+		"error": "candidate_not_found",
+		"message": f"no card with geekid={malicious_id} found; re-run recommend-candidates",
+	}
+	result = _invoke("--json", "hr", "recommend-action", malicious_id)
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "CANDIDATE_NOT_FOUND"
+	# 验证 geek_id 完整传入底层函数，未被截断
+	_, kwargs = mock_action.call_args
+	assert kwargs["geek_id"] == malicious_id
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._execute_action")
+def test_recommend_action_iframe_not_ready(mock_action):
+	"""iframe 未加载完成时应返回 iframe_not_ready 而非 access_denied。"""
+	mock_action.return_value = {
+		"clicked": False,
+		"error": "iframe_not_ready",
+		"message": "iframe is still loading or cross-origin; wait a moment and retry",
+	}
+	result = _invoke("--json", "hr", "recommend-action", "some_geek_id")
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "IFRAME_NOT_READY"
+	assert "retry" in parsed["error"]["message"]
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._collect_candidates")
+def test_recommend_candidates_iframe_not_found(mock_collect):
+	"""推荐页面未打开时应返回 iframe_not_found 错误。"""
+	mock_collect.side_effect = RuntimeError("iframe_not_found: recommendFrame iframe not found; ensure you are on the recommend page")
+	result = _invoke("--json", "hr", "recommend-candidates")
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "CDP_RECOMMEND_FAILED"
+	assert "iframe" in parsed["error"]["message"]
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._execute_action")
+def test_recommend_action_button_disabled(mock_action):
+	"""按钮已被禁用（已打过招呼）时应报告 button_disabled。"""
+	mock_action.return_value = {
+		"clicked": False,
+		"error": "button_disabled",
+		"message": 'button "打招呼" is already disabled (may have been clicked)',
+	}
+	result = _invoke("--json", "hr", "recommend-action", "abc123def456")
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "BUTTON_DISABLED"
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._execute_action")
+def test_recommend_action_default_button_text(mock_action):
+	"""不传 --button 时默认使用 '打招呼'。"""
+	mock_action.return_value = {
+		"clicked": True,
+		"geek_id": "abc123",
+		"candidate_name": "测试",
+		"button_text": "打招呼",
+		"confirmation": {
+			"button_changed": False,
+			"old_button_text": "打招呼",
+			"new_button_text": "打招呼",
+			"disabled_changed": False,
+			"toast_detected": None,
+			"confidence": "medium",
+		},
+		"targetTab": {"id": "t1", "title": "推荐", "url": "https://www.zhipin.com/web/chat/recommend"},
+	}
+	_invoke("--json", "hr", "recommend-action", "abc123")
+	_, kwargs = mock_action.call_args
+	assert kwargs["button_text"] == "打招呼"
+
+
+# ---------------------------------------------------------------------------
+# navigate 命令测试
+# ---------------------------------------------------------------------------
+
+@patch("boss_agent_cli.commands.recruiter.inspect_page.navigate_cdp_page")
+def test_navigate_success(mock_nav):
+	"""navigate 成功时输出导航结果。"""
+	mock_nav.return_value = {
+		"navigated_to": "https://www.zhipin.com/web/chat/index",
+		"page_url": "https://www.zhipin.com/web/chat/index",
+		"page_title": "BOSS直聘-沟通",
+		"ready_state": "complete",
+		"previous_url": "https://www.zhipin.com/web/chat/recommend",
+		"targetTab": {"id": "tab1", "title": "BOSS", "url": "https://www.zhipin.com/web/chat/recommend"},
+	}
+	result = _invoke("--json", "hr", "navigate", "https://www.zhipin.com/web/chat/index")
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert parsed["data"]["navigated_to"] == "https://www.zhipin.com/web/chat/index"
+	assert parsed["data"]["previous_url"] == "https://www.zhipin.com/web/chat/recommend"
+
+
+@patch("boss_agent_cli.commands.recruiter.inspect_page.navigate_cdp_page")
+def test_navigate_cdp_unreachable(mock_nav):
+	"""CDP 不可达时输出 CDP_NAVIGATE_FAILED。"""
+	mock_nav.side_effect = RuntimeError("cannot reach CDP")
+	result = _invoke("--json", "hr", "navigate", "https://www.zhipin.com/web/chat/index")
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "CDP_NAVIGATE_FAILED"
+	assert parsed["error"]["recoverable"] is True
