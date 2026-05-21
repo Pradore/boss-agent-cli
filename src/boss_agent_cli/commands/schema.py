@@ -784,7 +784,7 @@ SCHEMA_DATA = {
 				"candidates": "搜索候选人（支持 city/job-id/experience/degree/age/school-level/activeness/source/salary/select/page 筛选）",
 				"inspect-page": "通过 CDP 后台探测当前页面候选人卡片和按钮（不打开 DevTools）",
 					"navigate": "通过 CDP 将当前页面导航到指定 URL（如切换推荐页/沟通页）",
-					"recommend-candidates": "通过 CDP 采集推荐页面 iframe 内候选人卡片，输出含 geek_id 的结构化 JSON",
+					"recommend-candidates": "通过 CDP 采集推荐页面 iframe 内候选人卡片，支持 offset/refresh 获取新候选人",
 					"recommend-action": "根据 geek_id 在候选人卡片上点击打招呼按钮（两段式防误操作）",
 					"reply": "回复候选人消息",
 				"request-resume": "请求候选人分享附件简历",

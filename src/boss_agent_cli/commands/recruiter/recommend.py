@@ -37,9 +37,10 @@ _RECOMMEND_SCRIPT = r"""
 
 	const cards = Array.from(doc.querySelectorAll('li.card-item'));
 	const limit = __LIMIT__;
+	const offset = __OFFSET__;
 	const candidates = [];
 
-	for (let i = 0; i < cards.length && candidates.length < limit; i++) {
+	for (let i = offset; i < cards.length && candidates.length < limit; i++) {
 		const card = cards[i];
 
 		// geek_id — 从 .card-inner[data-geekid] 获取
@@ -85,7 +86,7 @@ _RECOMMEND_SCRIPT = r"""
 		})();
 
 		candidates.push({
-			index: candidates.length + 1,
+			index: i + 1,
 			geek_id,
 			name,
 			base_info,
@@ -103,6 +104,8 @@ _RECOMMEND_SCRIPT = r"""
 	return {
 		page_url: location.href,
 		iframe_url: iframe.src || null,
+		total_cards: cards.length,
+		offset: offset,
 		total_found: candidates.length,
 		candidates,
 	};
@@ -110,7 +113,7 @@ _RECOMMEND_SCRIPT = r"""
 """
 
 
-def _collect_candidates(cdp_url: str, *, url_contains: str | None = None, limit: int = 30) -> dict[str, Any]:
+def _collect_candidates(cdp_url: str, *, url_contains: str | None = None, limit: int = 30, offset: int = 0) -> dict[str, Any]:
 	"""通过 CDP 采集推荐候选人卡片。"""
 	import json
 
@@ -119,7 +122,7 @@ def _collect_candidates(cdp_url: str, *, url_contains: str | None = None, limit:
 	tabs = _load_cdp_tabs(cdp_url)
 	target_ws, tab = _pick_page_ws(tabs, url_contains=url_contains)
 
-	script = _RECOMMEND_SCRIPT.replace("__LIMIT__", str(int(limit)))
+	script = _RECOMMEND_SCRIPT.replace("__LIMIT__", str(int(limit))).replace("__OFFSET__", str(int(offset)))
 
 	with ws_client.connect(target_ws, max_size=8 * 1024 * 1024) as ws:
 		ws.send(json.dumps({
@@ -154,6 +157,219 @@ def _collect_candidates(cdp_url: str, *, url_contains: str | None = None, limit:
 				"url": tab.get("url"),
 			}
 			return cast("dict[str, Any]", value)
+
+
+# ---------------------------------------------------------------------------
+# recommend-refresh: 向下滚动 iframe 加载更多候选人
+# ---------------------------------------------------------------------------
+
+_REFRESH_SCRIPT = r"""
+(() => {
+	const iframe = document.querySelector('iframe[name="recommendFrame"]')
+		|| Array.from(document.querySelectorAll('iframe')).find(f => f.src && f.src.includes('frame/recommend'));
+	if (!iframe) return { scrolled: false, error: 'iframe_not_found', message: 'recommendFrame iframe not found' };
+
+	const doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+	if (!doc || !doc.body) return { scrolled: false, error: 'iframe_not_ready', message: 'iframe is still loading or cross-origin' };
+
+	const cardsBefore = doc.querySelectorAll('li.card-item').length;
+
+	// 查找可滚动的候选人列表容器
+	const scrollTarget = doc.querySelector('.recommend-card-list')
+		|| doc.querySelector('.card-list')
+		|| doc.querySelector('[class*="card-list"]')
+		|| doc.querySelector('[class*="recommend-list"]')
+		|| doc.scrollingElement
+		|| doc.documentElement;
+
+	const scrollHeightBefore = scrollTarget.scrollHeight;
+
+	// 滚动到底部，触发懒加载
+	scrollTarget.scrollTop = scrollTarget.scrollHeight;
+
+	// 等待 2 秒让新候选人加载
+	return new Promise(resolve => {
+		setTimeout(() => {
+			const cardsAfter = doc.querySelectorAll('li.card-item').length;
+			const scrollHeightAfter = scrollTarget.scrollHeight;
+			resolve({
+				scrolled: true,
+				method: 'scroll',
+				scroll_target: scrollTarget.className || scrollTarget.tagName,
+				cards_before: cardsBefore,
+				cards_after: cardsAfter,
+				new_cards_loaded: cardsAfter - cardsBefore,
+				scroll_height_changed: scrollHeightAfter !== scrollHeightBefore,
+				has_more: scrollHeightAfter > scrollHeightBefore,
+			});
+		}, 2000);
+	});
+})()
+"""
+
+
+def _refresh_page(cdp_url: str, *, url_contains: str | None = None) -> dict[str, Any]:
+	"""通过 CDP 向下滚动推荐页面 iframe，触发懒加载获取更多候选人。"""
+	import json
+
+	import websockets.sync.client as ws_client
+
+	tabs = _load_cdp_tabs(cdp_url)
+	target_ws, _tab = _pick_page_ws(tabs, url_contains=url_contains)
+
+	with ws_client.connect(target_ws, max_size=8 * 1024 * 1024) as ws:
+		ws.send(json.dumps({
+			"id": 1,
+			"method": "Runtime.evaluate",
+			"params": {
+				"expression": _REFRESH_SCRIPT,
+				"returnByValue": True,
+				"awaitPromise": True,
+			},
+		}))
+		while True:
+			message = json.loads(ws.recv(timeout=30.0))
+			if message.get("id") != 1:
+				continue
+			if message.get("error"):
+				raise RuntimeError(f"CDP Runtime.evaluate error: {message['error']}")
+			result = message.get("result", {}).get("result", {})
+			value = result.get("value") if isinstance(result, dict) else None
+			if not isinstance(value, dict):
+				raise RuntimeError("CDP refresh script did not return an object")
+			return cast("dict[str, Any]", value)
+
+
+# ---------------------------------------------------------------------------
+# recommend-page-reload: 重新加载推荐 iframe
+# ---------------------------------------------------------------------------
+
+_PAGE_REFRESH_SCRIPT = r"""
+(() => {
+	const iframe = document.querySelector('iframe[name="recommendFrame"]')
+		|| Array.from(document.querySelectorAll('iframe')).find(f => f.src && f.src.includes('frame/recommend'));
+	if (!iframe) return { refreshed: false, error: 'iframe_not_found', message: 'recommendFrame iframe not found' };
+
+	const beforeDoc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+	const cardsBefore = beforeDoc && beforeDoc.body ? beforeDoc.querySelectorAll('li.card-item').length : 0;
+	const beforeUrl = iframe.src || null;
+	let method = 'iframe_location_reload';
+
+	try {
+		if (iframe.contentWindow && iframe.contentWindow.location) {
+			iframe.contentWindow.location.reload();
+		} else if (beforeUrl) {
+			method = 'iframe_src_reset';
+			iframe.src = beforeUrl;
+		} else {
+			return { refreshed: false, error: 'iframe_reload_unavailable', message: 'iframe has no reloadable target' };
+		}
+	} catch (err) {
+		if (!beforeUrl) {
+			return { refreshed: false, error: 'iframe_reload_failed', message: String(err && err.message || err) };
+		}
+		method = 'iframe_src_reset';
+		iframe.src = beforeUrl;
+	}
+
+	const started = Date.now();
+	const timeoutMs = 10000;
+	const minStableMs = 3000;
+
+	return new Promise(resolve => {
+		const check = () => {
+			const doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+			const elapsed = Date.now() - started;
+			const readyState = doc ? doc.readyState : '';
+			const ready = doc && doc.body && (readyState === 'interactive' || readyState === 'complete');
+			const docChanged = !!doc && doc !== beforeDoc;
+
+			if (ready && (docChanged || elapsed >= minStableMs)) {
+				const cardsAfter = doc.querySelectorAll('li.card-item').length;
+				resolve({
+					refreshed: true,
+					method,
+					iframe_url_before: beforeUrl,
+					iframe_url_after: iframe.src || null,
+					cards_before: cardsBefore,
+					cards_after: cardsAfter,
+					elapsed_ms: elapsed,
+					timed_out: false,
+				});
+				return;
+			}
+
+			if (elapsed >= timeoutMs) {
+				const cardsAfter = ready ? doc.querySelectorAll('li.card-item').length : null;
+				resolve({
+					refreshed: true,
+					method,
+					iframe_url_before: beforeUrl,
+					iframe_url_after: iframe.src || null,
+					cards_before: cardsBefore,
+					cards_after: cardsAfter,
+					elapsed_ms: elapsed,
+					timed_out: true,
+				});
+				return;
+			}
+
+			setTimeout(check, 250);
+		};
+		setTimeout(check, 250);
+	});
+})()
+"""
+
+
+def _reload_recommend_page(cdp_url: str, *, url_contains: str | None = None) -> dict[str, Any]:
+	"""通过 CDP 重新加载推荐 iframe，让推荐页生成新候选人列表。"""
+	import json
+
+	import websockets.sync.client as ws_client
+
+	tabs = _load_cdp_tabs(cdp_url)
+	target_ws, _tab = _pick_page_ws(tabs, url_contains=url_contains)
+
+	with ws_client.connect(target_ws, max_size=8 * 1024 * 1024) as ws:
+		ws.send(json.dumps({
+			"id": 1,
+			"method": "Runtime.evaluate",
+			"params": {
+				"expression": _PAGE_REFRESH_SCRIPT,
+				"returnByValue": True,
+				"awaitPromise": True,
+			},
+		}))
+		while True:
+			message = json.loads(ws.recv(timeout=30.0))
+			if message.get("id") != 1:
+				continue
+			if message.get("error"):
+				raise RuntimeError(f"CDP Runtime.evaluate error: {message['error']}")
+			if message.get("result", {}).get("exceptionDetails"):
+				raise RuntimeError(f"JS exception: {message['result']['exceptionDetails']}")
+			result = message.get("result", {}).get("result", {})
+			value = result.get("value") if isinstance(result, dict) else None
+			if not isinstance(value, dict):
+				raise RuntimeError("CDP page refresh script did not return an object")
+			if value.get("error"):
+				raise RuntimeError(f"{value['error']}: {value.get('message', '')}")
+			return cast("dict[str, Any]", value)
+
+
+def _candidate_batch_exhausted(data: dict[str, Any]) -> tuple[bool, str | None]:
+	"""判断当前 offset 批次是否已经耗尽。"""
+	candidates = data.get("candidates", [])
+	candidate_count = len(candidates) if isinstance(candidates, list) else 0
+	total_found = int(data.get("total_found", candidate_count) or 0)
+	offset = int(data.get("offset", 0) or 0)
+	total_cards = int(data.get("total_cards", candidate_count) or 0)
+	if offset >= total_cards:
+		return True, "offset_exhausted"
+	if total_found == 0:
+		return True, "empty_batch"
+	return False, None
 
 
 # ---------------------------------------------------------------------------
@@ -307,13 +523,37 @@ def _execute_action(
 @click.option("--cdp-url", default=None, help="Chrome CDP 地址；默认使用全局 --cdp-url 或 http://localhost:9222")
 @click.option("--url-contains", default=None, help="只探测 URL 包含该片段的页面 tab")
 @click.option("--limit", default=30, type=int, help="最多采集多少个候选人卡片（默认 30）")
+@click.option("--offset", default=0, type=int, help="跳过前 N 个候选人卡片，用于翻页采集（默认 0）")
+@click.option("--refresh", "do_refresh", is_flag=True, default=False, help="先滚动加载；目标批次仍为空时刷新推荐页")
 @click.pass_context
 @handle_auth_errors("recruiter-recommend-candidates")
-def recommend_candidates_cmd(ctx: click.Context, cdp_url: str | None, url_contains: str | None, limit: int) -> None:
+def recommend_candidates_cmd(ctx: click.Context, cdp_url: str | None, url_contains: str | None, limit: int, offset: int, do_refresh: bool) -> None:
 	"""通过 CDP 采集推荐页面候选人卡片（iframe 内），输出结构化 JSON。"""
 	resolved_cdp_url = cdp_url or ctx.obj.get("cdp_url") or _DEFAULT_CDP_URL
 	try:
-		data = _collect_candidates(str(resolved_cdp_url), url_contains=url_contains, limit=limit)
+		if do_refresh:
+			refresh_result = _refresh_page(str(resolved_cdp_url), url_contains=url_contains)
+		else:
+			refresh_result = None
+		data = _collect_candidates(str(resolved_cdp_url), url_contains=url_contains, limit=limit, offset=offset)
+		if refresh_result is not None:
+			data["refresh_result"] = refresh_result
+		if do_refresh:
+			exhausted, reason = _candidate_batch_exhausted(data)
+			if exhausted:
+				page_refresh_result = _reload_recommend_page(str(resolved_cdp_url), url_contains=url_contains)
+				page_refresh_result.update({
+					"triggered": True,
+					"reason": reason,
+					"previous_offset": data.get("offset"),
+					"previous_total_cards": data.get("total_cards"),
+					"previous_total_found": data.get("total_found"),
+				})
+				data = _collect_candidates(str(resolved_cdp_url), url_contains=url_contains, limit=limit, offset=0)
+				data["refresh_result"] = refresh_result
+				page_refresh_result["collected_after_refresh"] = data.get("total_found")
+				page_refresh_result["total_cards_after_collect"] = data.get("total_cards")
+				data["page_refresh_result"] = page_refresh_result
 	except RuntimeError as exc:
 		handle_error_output(
 			ctx,
@@ -326,11 +566,35 @@ def recommend_candidates_cmd(ctx: click.Context, cdp_url: str | None, url_contai
 		return
 	def _render_candidates(d: dict) -> None:
 		candidates = d.get("candidates", [])
+
+		# 显示滚动加载结果
+		refresh = d.get("refresh_result")
+		if refresh:
+			if refresh.get("scrolled"):
+				new_loaded = refresh.get("new_cards_loaded", 0)
+				console.print(f"[green]✓ 已向下滚动 (新加载 {new_loaded} 人)[/green]")
+			else:
+				console.print(f"[yellow]⚠ 滚动未成功: {refresh.get('message', '')}[/yellow]")
+
+		page_refresh = d.get("page_refresh_result")
+		if page_refresh:
+			if page_refresh.get("refreshed"):
+				found_after = page_refresh.get("collected_after_refresh", d.get("total_found", 0))
+				console.print(f"[green]✓ 已刷新推荐页 (新列表采集 {found_after} 人)[/green]")
+			else:
+				console.print(f"[yellow]⚠ 推荐页刷新未成功: {page_refresh.get('message', '')}[/yellow]")
+
 		if not candidates:
 			console.print("[yellow]no candidates found[/yellow]")
 			return
 
-		table = Table(title=f"推荐候选人 ({d.get('total_found', len(candidates))} 人)", show_lines=True)
+		total_cards = d.get('total_cards', len(candidates))
+		offset_val = d.get('offset', 0)
+		found = d.get('total_found', len(candidates))
+		if offset_val > 0:
+			table = Table(title=f"推荐候选人 (本批 {found} 人 / 跳过前 {offset_val} / 页面共 {total_cards} 人)", show_lines=True)
+		else:
+			table = Table(title=f"推荐候选人 ({found} 人 / 页面共 {total_cards} 人)", show_lines=True)
 		table.add_column("#", style="dim", width=3)
 		table.add_column("姓名", style="bold cyan", max_width=10)
 		table.add_column("性别", width=4)
@@ -371,6 +635,8 @@ def recommend_candidates_cmd(ctx: click.Context, cdp_url: str | None, url_contai
 		render=_render_candidates,
 		hints={"next_actions": [
 			"筛选候选人后使用 boss hr recommend-action <geek_id> 执行打招呼",
+			"boss hr recommend-candidates --offset N — 跳过前 N 人，采集下一批",
+			"boss hr recommend-candidates --refresh — 先滚动，耗尽时刷新推荐页获取新候选人",
 			"boss hr inspect-page — 查看页面详细探测结果",
 		]},
 	)
@@ -464,5 +730,7 @@ __all__ = [
 	"recommend_candidates_cmd",
 	"recommend_action_cmd",
 	"_collect_candidates",
+	"_refresh_page",
+	"_reload_recommend_page",
 	"_execute_action",
 ]

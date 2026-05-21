@@ -20,7 +20,7 @@
 ## 用法
 
 ```bash
-boss hr recommend-candidates [--cdp-url URL] [--url-contains FRAGMENT] [--limit N]
+boss hr recommend-candidates [--cdp-url URL] [--url-contains FRAGMENT] [--limit N] [--offset N] [--refresh]
 ```
 
 ## 参数说明
@@ -30,6 +30,8 @@ boss hr recommend-candidates [--cdp-url URL] [--url-contains FRAGMENT] [--limit 
 | `--cdp-url` | string | `http://localhost:9222` | Chrome CDP 调试端口地址。如果 Chrome 在远程机器或非默认端口，需手动指定 |
 | `--url-contains` | string | _(无)_ | 仅探测 URL 包含该片段的页面 Tab。当浏览器打开了多个 Tab 时，用于精确定位目标页面。例如 `--url-contains recommend` |
 | `--limit` | int | `30` | 最多采集多少个候选人卡片。页面通常展示 16 个，设置更大值不会出错 |
+| `--offset` | int | `0` | 跳过前 N 个候选人卡片，用于翻页采集。例如第一批 `--limit 5`，第二批 `--limit 5 --offset 5` |
+| `--refresh` | flag | _(关闭)_ | 先向下滚动 iframe 加载更多候选人；如果目标 `offset` 批次仍为空，则刷新推荐 iframe 并从 `offset=0` 采集刷新后的新列表 |
 
 ### 全局参数
 
@@ -47,6 +49,8 @@ boss hr recommend-candidates [--cdp-url URL] [--url-contains FRAGMENT] [--limit 
   "data": {
     "page_url": "https://www.zhipin.com/web/chat/recommend",
     "iframe_url": "https://www.zhipin.com/web/frame/recommend/?jobid=null&...",
+    "total_cards": 16,
+    "offset": 0,
     "total_found": 16,
     "candidates": [
       {
@@ -93,6 +97,35 @@ boss hr recommend-candidates [--cdp-url URL] [--url-contains FRAGMENT] [--limit 
 | `gender` | string \| null | 性别：`"male"` / `"female"` / `null`（未知） |
 | `greet_btn` | object \| null | 打招呼按钮状态。`text`：按钮文字；`disabled`：是否已禁用（已打过招呼） |
 
+### 批次和刷新字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `total_cards` | int | 当前 iframe DOM 中的候选人卡片总数 |
+| `offset` | int | 本次采集跳过的卡片数量；页面刷新后重新采集时会回到 `0` |
+| `total_found` | int | 本批实际返回的候选人数 |
+| `refresh_result` | object \| null | 传入 `--refresh` 时的滚动加载结果，包含 `new_cards_loaded`、`has_more` 等字段 |
+| `page_refresh_result` | object \| null | 仅当 `--refresh` 后目标批次仍为空时出现，表示已重新加载推荐 iframe 并采集新列表 |
+
+`--refresh` 在滚动后仍无候选人时会额外返回：
+
+```json
+{
+  "refresh_result": {
+    "scrolled": true,
+    "new_cards_loaded": 0,
+    "has_more": false
+  },
+  "page_refresh_result": {
+    "triggered": true,
+    "reason": "offset_exhausted",
+    "previous_offset": 16,
+    "previous_total_cards": 16,
+    "collected_after_refresh": 5
+  }
+}
+```
+
 ## 使用示例
 
 ### 基本采集
@@ -109,6 +142,32 @@ boss --json hr recommend-candidates --limit 5
 ```bash
 boss --json hr recommend-candidates --cdp-url http://192.168.1.100:9222
 ```
+
+### 翻页采集
+```bash
+# 第一批（前 5 人）
+boss --json hr recommend-candidates --limit 5
+
+# 第二批（跳过前 5 人）
+boss --json hr recommend-candidates --limit 5 --offset 5
+
+# 第三批（跳过前 10 人）
+boss --json hr recommend-candidates --limit 5 --offset 10
+```
+
+### 刷新推荐列表
+```bash
+# 向下滚动加载更多候选人
+boss --json hr recommend-candidates --limit 5 --refresh
+
+# 滚动后配合 offset 采集新加载的候选人
+boss --json hr recommend-candidates --limit 5 --offset 10 --refresh
+
+# 当前 DOM 候选人已处理完：先滚动，仍无新人时刷新推荐 iframe 并从新列表采集
+boss --json hr recommend-candidates --limit 5 --offset 16 --refresh
+```
+
+当 `--refresh` 触发页面刷新后，输出中的 `offset` 会回到 `0`，表示本批候选人来自刷新后的新推荐列表。调用方应继续用候选人的 `geek_id` 去重，避免重复筛选或重复打招呼。
 
 ### 配合 recommend-action 使用
 ```bash

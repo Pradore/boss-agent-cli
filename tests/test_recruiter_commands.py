@@ -675,6 +675,8 @@ def test_load_cdp_tabs_unreachable(mock_urlopen):
 _FAKE_RECOMMEND_DATA = {
 	"page_url": "https://www.zhipin.com/web/chat/recommend",
 	"iframe_url": "https://www.zhipin.com/web/frame/recommend/?jobid=null",
+	"total_cards": 2,
+	"offset": 0,
 	"total_found": 2,
 	"candidates": [
 		{
@@ -742,6 +744,8 @@ def test_recommend_candidates_empty_page(mock_collect):
 	mock_collect.return_value = {
 		"page_url": "https://www.zhipin.com/web/chat/recommend",
 		"iframe_url": "https://www.zhipin.com/web/frame/recommend/",
+		"total_cards": 0,
+		"offset": 0,
 		"total_found": 0,
 		"candidates": [],
 		"targetTab": {"id": "tab1", "title": "推荐", "url": "https://www.zhipin.com/web/chat/recommend"},
@@ -762,6 +766,142 @@ def test_recommend_candidates_limit_forwarded(mock_collect):
 	mock_collect.assert_called_once()
 	_, kwargs = mock_collect.call_args
 	assert kwargs["limit"] == 10
+	assert kwargs["offset"] == 0
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._collect_candidates")
+def test_recommend_candidates_offset_forwarded(mock_collect):
+	"""--offset 参数正确传入底层函数。"""
+	mock_collect.return_value = {**_FAKE_RECOMMEND_DATA, "offset": 5}
+	_invoke("--json", "hr", "recommend-candidates", "--limit", "5", "--offset", "5")
+	mock_collect.assert_called_once()
+	_, kwargs = mock_collect.call_args
+	assert kwargs["limit"] == 5
+	assert kwargs["offset"] == 5
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._reload_recommend_page")
+@patch("boss_agent_cli.commands.recruiter.recommend._refresh_page")
+@patch("boss_agent_cli.commands.recruiter.recommend._collect_candidates")
+def test_recommend_candidates_refresh_uses_scrolled_batch(mock_collect, mock_refresh, mock_reload):
+	"""--refresh 滚动后目标批次有候选人时不刷新 iframe。"""
+	mock_refresh.return_value = {
+		"scrolled": True,
+		"method": "scroll",
+		"cards_before": 10,
+		"cards_after": 11,
+		"new_cards_loaded": 1,
+		"has_more": True,
+	}
+	mock_collect.return_value = {
+		**_FAKE_RECOMMEND_DATA,
+		"total_cards": 11,
+		"offset": 10,
+		"total_found": 1,
+		"candidates": [_FAKE_RECOMMEND_DATA["candidates"][0]],
+	}
+
+	result = _invoke("--json", "hr", "recommend-candidates", "--limit", "5", "--offset", "10", "--refresh")
+
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["data"]["total_found"] == 1
+	assert parsed["data"]["refresh_result"]["new_cards_loaded"] == 1
+	assert "page_refresh_result" not in parsed["data"]
+	mock_reload.assert_not_called()
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._reload_recommend_page")
+@patch("boss_agent_cli.commands.recruiter.recommend._refresh_page")
+@patch("boss_agent_cli.commands.recruiter.recommend._collect_candidates")
+def test_recommend_candidates_refresh_reloads_when_scrolled_batch_exhausted(
+	mock_collect,
+	mock_refresh,
+	mock_reload,
+):
+	"""--refresh 滚动后仍耗尽时刷新 iframe，并从新列表 offset=0 采集。"""
+	exhausted_data = {
+		"page_url": "https://www.zhipin.com/web/chat/recommend",
+		"iframe_url": "https://www.zhipin.com/web/frame/recommend/",
+		"total_cards": 10,
+		"offset": 10,
+		"total_found": 0,
+		"candidates": [],
+		"targetTab": {"id": "tab1", "title": "推荐", "url": "https://www.zhipin.com/web/chat/recommend"},
+	}
+	new_data = {
+		**_FAKE_RECOMMEND_DATA,
+		"total_cards": 2,
+		"offset": 0,
+		"total_found": 2,
+	}
+	mock_refresh.return_value = {
+		"scrolled": True,
+		"method": "scroll",
+		"cards_before": 10,
+		"cards_after": 10,
+		"new_cards_loaded": 0,
+		"has_more": False,
+	}
+	mock_reload.return_value = {
+		"refreshed": True,
+		"method": "iframe_location_reload",
+		"cards_before": 10,
+		"cards_after": 2,
+		"timed_out": False,
+	}
+	mock_collect.side_effect = [exhausted_data, new_data]
+
+	result = _invoke("--json", "hr", "recommend-candidates", "--limit", "5", "--offset", "10", "--refresh")
+
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["data"]["offset"] == 0
+	assert parsed["data"]["total_found"] == 2
+	assert parsed["data"]["page_refresh_result"]["reason"] == "offset_exhausted"
+	assert parsed["data"]["page_refresh_result"]["previous_offset"] == 10
+	assert parsed["data"]["page_refresh_result"]["collected_after_refresh"] == 2
+	assert mock_collect.call_args_list[0].kwargs["offset"] == 10
+	assert mock_collect.call_args_list[1].kwargs["offset"] == 0
+
+
+@patch("boss_agent_cli.commands.recruiter.recommend._reload_recommend_page")
+@patch("boss_agent_cli.commands.recruiter.recommend._refresh_page")
+@patch("boss_agent_cli.commands.recruiter.recommend._collect_candidates")
+def test_recommend_candidates_refresh_reports_empty_after_page_reload(mock_collect, mock_refresh, mock_reload):
+	"""刷新 iframe 后仍无候选人时保留空结果和刷新状态。"""
+	empty_data = {
+		"page_url": "https://www.zhipin.com/web/chat/recommend",
+		"iframe_url": "https://www.zhipin.com/web/frame/recommend/",
+		"total_cards": 0,
+		"offset": 0,
+		"total_found": 0,
+		"candidates": [],
+		"targetTab": {"id": "tab1", "title": "推荐", "url": "https://www.zhipin.com/web/chat/recommend"},
+	}
+	mock_refresh.return_value = {
+		"scrolled": True,
+		"method": "scroll",
+		"cards_before": 0,
+		"cards_after": 0,
+		"new_cards_loaded": 0,
+		"has_more": False,
+	}
+	mock_reload.return_value = {
+		"refreshed": True,
+		"method": "iframe_location_reload",
+		"cards_before": 0,
+		"cards_after": 0,
+		"timed_out": False,
+	}
+	mock_collect.side_effect = [empty_data, empty_data]
+
+	result = _invoke("--json", "hr", "recommend-candidates", "--refresh")
+
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["data"]["candidates"] == []
+	assert parsed["data"]["page_refresh_result"]["collected_after_refresh"] == 0
 
 
 @patch("boss_agent_cli.commands.recruiter.recommend._execute_action")
